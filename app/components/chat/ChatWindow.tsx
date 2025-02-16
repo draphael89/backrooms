@@ -3,22 +3,25 @@
 import { useState, useCallback, useRef } from 'react';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
+import { BranchSelector } from './BranchSelector';
+import { useConversation } from '@/lib/hooks/useConversation';
 import type { Message } from '@/lib/types';
 
 interface Props {
-  initialMessages?: Message[];
-  onSendMessage?: (content: string) => Promise<void>;
-  onFork?: (messageId: string) => void;
   className?: string;
 }
 
-export function ChatWindow({
-  initialMessages = [],
-  onSendMessage,
-  onFork,
-  className = ''
-}: Props) {
-  const [messages, setMessages] = useState<Message[]>(initialMessages);
+export function ChatWindow({ className = '' }: Props) {
+  const {
+    currentBranch,
+    branches,
+    updateMessages,
+    fork,
+    switchToBranch,
+    removeBranch,
+    clearAll
+  } = useConversation();
+
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [streamingContent, setStreamingContent] = useState('');
@@ -30,6 +33,9 @@ export function ChatWindow({
     // Clear any previous errors
     setError(null);
 
+    // Check if this is an image generation command
+    const isImageCommand = content.startsWith('/generate ');
+    
     // Create user message
     const userMessage: Message = {
       id: crypto.randomUUID(),
@@ -39,63 +45,96 @@ export function ChatWindow({
       timestamp: Date.now()
     };
 
-    setMessages(prev => [...prev, userMessage]);
+    const newMessages = [...currentBranch.messages, userMessage];
+    updateMessages(newMessages);
     setIsLoading(true);
     setStreamingContent('');
 
-    // Create a new AbortController for this request
-    abortControllerRef.current = new AbortController();
-
     try {
-      // Start streaming response
-      const response = await fetch('/api/chat/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: [...messages, userMessage] }),
-        signal: abortControllerRef.current.signal
-      });
+      if (isImageCommand) {
+        // Extract the prompt from the command
+        const prompt = content.slice(10);
+        
+        // Call the image generation API
+        const response = await fetch('/api/generate/image', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt })
+        });
 
-      if (!response.ok) {
-        throw new Error('Failed to send message');
-      }
+        if (!response.ok) {
+          throw new Error('Failed to generate image');
+        }
 
-      if (!response.body) {
-        throw new Error('No response body');
-      }
+        const data = await response.json();
+        if (!data.images?.[0]) {
+          throw new Error('No image generated');
+        }
 
-      // Read the stream
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
+        // Add the image message
+        const imageMessage: Message = {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: data.images[0],
+          type: 'image',
+          timestamp: Date.now()
+        };
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        updateMessages([...newMessages, imageMessage]);
+      } else {
+        // Create a new AbortController for this request
+        abortControllerRef.current = new AbortController();
 
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n').filter(line => line.trim() !== '');
+        // Start streaming response
+        const response = await fetch('/api/chat/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: newMessages }),
+          signal: abortControllerRef.current.signal
+        });
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') {
-              // End of stream, add the complete message
-              const assistantMessage: Message = {
-                id: crypto.randomUUID(),
-                role: 'assistant',
-                content: streamingContent,
-                type: 'text',
-                timestamp: Date.now()
-              };
-              setMessages(prev => [...prev, assistantMessage]);
-              setStreamingContent('');
-              break;
-            }
+        if (!response.ok) {
+          throw new Error('Failed to send message');
+        }
 
-            try {
-              const { text } = JSON.parse(data);
-              setStreamingContent(prev => prev + text);
-            } catch (e) {
-              console.error('Failed to parse chunk:', data);
+        if (!response.body) {
+          throw new Error('No response body');
+        }
+
+        // Read the stream
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value);
+          const lines = chunk.split('\n').filter(line => line.trim() !== '');
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              if (data === '[DONE]') {
+                // End of stream, add the complete message
+                const assistantMessage: Message = {
+                  id: crypto.randomUUID(),
+                  role: 'assistant',
+                  content: streamingContent,
+                  type: 'text',
+                  timestamp: Date.now()
+                };
+                updateMessages([...newMessages, assistantMessage]);
+                setStreamingContent('');
+                break;
+              }
+
+              try {
+                const { text } = JSON.parse(data);
+                setStreamingContent(prev => prev + text);
+              } catch (e) {
+                console.error('Failed to parse chunk:', data);
+              }
             }
           }
         }
@@ -108,16 +147,18 @@ export function ChatWindow({
       const errorMessage: Message = {
         id: crypto.randomUUID(),
         role: 'assistant',
-        content: 'Sorry, something went wrong. Please try again.',
+        content: isImageCommand 
+          ? 'Sorry, I failed to generate the image. Please try again.'
+          : 'Sorry, something went wrong. Please try again.',
         type: 'text',
         timestamp: Date.now()
       };
-      setMessages(prev => [...prev, errorMessage]);
+      updateMessages([...newMessages, errorMessage]);
     } finally {
       setIsLoading(false);
       abortControllerRef.current = null;
     }
-  }, [messages]);
+  }, [currentBranch.messages, updateMessages]);
 
   const handleFork = useCallback((messageId: string) => {
     // Cancel any ongoing streaming
@@ -127,29 +168,47 @@ export function ChatWindow({
       setStreamingContent('');
     }
 
-    if (onFork) {
-      onFork(messageId);
-    }
-  }, [onFork]);
+    // Find the message and its index
+    const messageIndex = currentBranch.messages.findIndex(m => m.id === messageId);
+    if (messageIndex === -1) return;
+
+    // Create a new branch starting from this message
+    const messages = currentBranch.messages.slice(0, messageIndex + 1);
+    fork(messageId, messages);
+  }, [currentBranch.messages, fork]);
 
   return (
-    <div className={`flex flex-col h-full bg-gray-900 ${className}`}>
-      {error && (
-        <div className="bg-red-500/10 border border-red-500/50 text-red-500 px-4 py-2 mb-2 rounded">
-          {error}
-        </div>
-      )}
-      <MessageList
-        messages={messages}
-        onFork={onFork ? handleFork : undefined}
-        streamingContent={streamingContent}
-        className="flex-1"
-      />
-      <MessageInput
-        onSendMessage={handleSendMessage}
-        disabled={isLoading}
-        className="flex-shrink-0"
-      />
+    <div className={`grid grid-cols-1 lg:grid-cols-4 gap-4 h-full ${className}`}>
+      <div className="lg:col-span-3 flex flex-col bg-gray-900 rounded-lg overflow-hidden">
+        {error && (
+          <div className="bg-red-500/10 border border-red-500/50 text-red-500 px-4 py-2 m-2 rounded">
+            {error}
+          </div>
+        )}
+        <MessageList
+          messages={currentBranch.messages}
+          onFork={handleFork}
+          streamingContent={streamingContent}
+          className="flex-1"
+        />
+        <MessageInput
+          onSendMessage={handleSendMessage}
+          disabled={isLoading}
+          placeholder="Type a message or use /generate to create an image..."
+          className="flex-shrink-0"
+        />
+      </div>
+
+      <div className="hidden lg:block">
+        <BranchSelector
+          branches={branches}
+          currentBranchId={currentBranch.id}
+          onSwitchBranch={switchToBranch}
+          onDeleteBranch={removeBranch}
+          onClearAll={clearAll}
+          className="h-full"
+        />
+      </div>
     </div>
   );
 } 
